@@ -68,7 +68,7 @@ class fabric(Topo):
         # dpid, name, {next-hop: physical port}
         #
         # switchInfo format:
-        #   [switchID - 1] :  [dpid, name, {remote dpid : port}]
+        #   [id(dpid-1)] :  [dpid, name, {remote dpid : port}]
 
         self.switchInfo = [None] * nodeNo
 

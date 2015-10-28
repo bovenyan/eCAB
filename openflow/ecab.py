@@ -27,13 +27,11 @@ from ryu.ofproto import inet
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import arp
-from ryu.lib import mac
-# from ryu.lib import ip
+from ryu.lib.packet import icmp
 from ryu.lib.packet import ipv4
-# from ryu.lib.packet import tcp
+# from ryu.lib import mac
 from ryu import utils
-# import struct
-import random
+# import random
 from cab_client import *
 import pickle
 
@@ -54,7 +52,14 @@ class CABSwitch(app_manager.RyuApp):
         self.tracefile = raw_input('Enter Tracename: ')
         self.buckets = {}
         self.query_map = {}
-        self.portMap = pickle.load("portMao.dat")
+        self.portMap = pickle.load("portMap.dat")
+        self.pathMap = pickle.load("routeMap.dat")
+
+    def id_to_ipInt(self, ID):
+        return 655360 + ID
+
+    def ipInt_to_id(self, ipInt):
+        return ipInt - 655360
 
     def add_flow(self, datapath, table_id, priority, match, inst, buffer_id,
                  hard_timeout=60):
@@ -64,7 +69,7 @@ class CABSwitch(app_manager.RyuApp):
                                 match=match, instructions=inst,
                                 buffer_id=buffer_id)
         datapath.send_msg(mod)
-        self.flowmod += 1
+        # self.flowmod += 1
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -88,11 +93,11 @@ class CABSwitch(app_manager.RyuApp):
                                              actions)]
         self.add_flow(datapath, 0, 0, match, inst, ofproto.OFP_NO_BUFFER, 0)
         # set table1 default : drop
-        inst2 = []
-        self.add_flow(datapath, 1, 0, match, inst2, ofproto.OFP_NO_BUFFER, 0)
+        # inst2 = []
+        # self.add_flow(datapath, 1, 0, match, inst2, ofproto.OFP_NO_BUFFER, 0)
 
-        m = threading.Thread(target=self.monitor)
-        m.start()
+        # m = threading.Thread(target=self.monitor)
+        # m.start()
         c = threading.Thread(target=self.clean_query_map)
         c.start()
 
@@ -126,24 +131,19 @@ class CABSwitch(app_manager.RyuApp):
             self.is_overflow = False
 
         pkt = packet.Packet(msg.data)
-        # header class:
-        # http://ryu.readthedocs.org/en/latest/library_packet_ref.html
 
         # parse ethernet header
-        eth = pkt.get_protocol(ethernet.ethernet)
-        # eth_dst = eth.dst
-        # eth_src = eth.src
-        ethertype = eth.ethertype
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        ethertype = eth_pkt.ethertype
 
         if ethertype == ether.ETH_TYPE_ARP:
-            self.handle_arp(datapath, pkt, in_port)
+            arp_pkt = pkt.get_protocol(arp.arp)
+            self.handle_arp(datapath, eth_pkt, arp_pkt, in_port)
             return
 
-        if ethertype == ether.ETH_TYPE_ICMP:
-            self.handle_ping(datapath, pkt, in_port)
-
         if ethertype == ether.ETH_TYPE_IP:
-            self.handle_ip(datapath, msg, in_port)
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            self.handle_ip(datapath, pkt, ip_pkt, in_port)
             return
 
     def handle_no_buffer(self, datapath, data, in_port):
@@ -166,14 +166,9 @@ class CABSwitch(app_manager.RyuApp):
                                           in_port, actions)
             datapath.send_msg(req)
 
-    def handle_arp(self, datapath, pkt, in_port):
+    def handle_arp(self, datapath, eth_pkt, arp_pkt, in_port):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        # parse out the ethernet and arp packet
-        eth_pkt = pkt.get_protocol(ethernet.ethernet)
-        arp_pkt = pkt.get_protocol(arp.arp)
-        # obtain the MAC of dst IP
 
         temp = dst_ip.split('.')
         arp_resolv_mac = "00:00:00:00:00:" + hex(temp[3])[-2:]
@@ -194,13 +189,72 @@ class CABSwitch(app_manager.RyuApp):
                                   ofproto.OFPP_CONTROLLER, actions, data)
         datapath.send_msg(out)
 
-    def handle_ping(self, datapath, msg, in_port):
+    def handle_ping(self, datapath, ip_pkt, in_port):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        match = parser.OFPMatch()
-        match.set_dl_type(ether.ETH_TYPE_IP)
-        match.set_ip_proto(inet.IPPROTO_ICMP)
 
+        # extract destination
+        srcHost = ip_pkt.src
+        src_dpid = int(srcHost.split('.')[3])
+        dstHost = ip_pkt.dst
+        dst_dpid = int(dstHost.split('.')[3])
+
+        # if not the fisrt packet of the flow, don't query eCAB
+        key = srcHost + dstHost
+
+        if key in self.query_map:
+            # drop the packet
+            return
+        self.query_map[key] = time.time()
+
+        # TODO: query eCAB
+        # request = pkt_h(ipv4_to_int(ip_src), ipv4_to_int(ip_dst),
+        #                src_port, dst_port)
+        # rules = self.cab.query(request)
+
+        # extract path and port
+        path = pathMap[src_dpid-1][dst_dpid-1]
+        dpidPorts = []  # [dpid, srcPort, dstPort]
+        sPort = 1  # sPort = 1
+
+        for idx in range(len(path)-1):
+            curDPID = path[idx]
+            dPort = portMap[curDPID-1][2][path[idx+1]]
+            dpidPorts.append([curDPID, sPort, dPort])
+            sPort = portMap[path[idx+1]-1][2][curDPID]
+
+        dpidPorts.append(dst_dpid, sPort, 1)
+
+        for rec in reversed(dpidPorts):
+            # TODO Insert ten redundant flows
+
+            # forward
+            matchFwd = parser.OFPMatch()
+            matchFwd.set_in_port(rec[1])
+            matchFwd.set_dl_type(ether.ETH_TYPE_IP)
+            matchFwd.set_ipv4_src(self.id_to_ipInt(src_dpid))
+            matchFwd.set_ipv4_dst(self.id_to_ipInt(dst_dpid))
+            matchFwd.set_ip_proto(inet.IPPROTO_ICMP)
+            actions = [parser.OFPActionOutput(rec[2])]
+            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                                 actions)]
+            self.add_flow(rec[0], 0, 100, matchFwd, inst,
+                          ofproto.OFP_NO_BUFFER, 20)
+
+            # backward
+            matchBwd = parser.OFPMatch()
+            matchBwd.set_in_port(rec[2])
+            matchBwd.set_dl_type(ether.ETH_TYPE_IP)
+            matchBwd.set_ipv4_src(self.id_to_ipInt(dst_dpid))
+            matchBwd.set_ipv4_dst(self.id_to_ipInt(src_dpid))
+            matchBwd.set_ip_proto(inet.IPPROTO_ICMP)
+            actions = [parser.OFPActionOutput(rec[1])]
+            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                                 actions)]
+            self.add_flow(rec[0], 0, 100, matchBwd, inst,
+                          ofproto.OFP_NO_BUFFER, 20)
+
+        # cache
 
         # actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD, 0)]
         # inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
@@ -209,14 +263,20 @@ class CABSwitch(app_manager.RyuApp):
         # if msg.buffer_id == ofproto.OFP_NO_BUFFER:
         #     self.handle_no_buffer(datapath, msg.data, in_port)
 
-    def handle_ip(self, datapath, msg, in_port):
-        return  # boven: do nothing
+    def handle_ip(self, datapath, pkt, ip_pkt, in_port):
+        if proto == inet.IPPROTO_ICMP:
+            icmp_pkt = pkt.get_protocol(icmp.icmp)
+            icmp_type = icmp_pkt.type
 
+            if icmp_type == 8 or icmp_type == 0:
+                self.handle_ping(ip_pkt, in_port)
+
+        return  # boven: do nothing if it's not icmp
+        """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         # try to parse ip header
-        pkt = packet.Packet(msg.data)
         ip_header = pkt.get_protocol(ipv4.ipv4)
         self.logger.debug('ip src %s dst %s', ip_header.src, ip_header.dst)
         ip_src = ip_header.src
@@ -348,7 +408,9 @@ class CABSwitch(app_manager.RyuApp):
                           eth_mask_to_str(bucket.port_src_mask),
                           eth_to_str(bucket.port_dst),
                           eth_mask_to_str(bucket.port_dst_mask))
+    """
 
+    """
     def monitor(self):
         with open('./results/results_cab_'+self.tracefile, 'w') as f:
             f.write('time\tqueries\tPacketIn\tFlowMod\n')
@@ -365,3 +427,4 @@ class CABSwitch(app_manager.RyuApp):
             for i in self.query_map.keys():
                 if (time.time() - self.query_map[i]) > 8:
                     del self.query_map[i]
+    """
