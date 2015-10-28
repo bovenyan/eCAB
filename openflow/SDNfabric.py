@@ -1,18 +1,21 @@
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.cli import CLI
-from mininet.node import RemoteController
+from mininet.node import RemoteController, OVSSwitch
+from functools import partial
 import sys
 import pickle
+import networkx as nx
 
 
 # parsing the input file
 def parseTopoFile(filename):
-    links = set()
     nodeNo = 0
 
     obj = open(filename, 'r')
     lines = obj.readlines()
+
+    G = nx.Graph()
 
     for line in lines:
         line = line[:-1]
@@ -24,43 +27,44 @@ def parseTopoFile(filename):
 
         if '-' in line:
             pairStr = line.split('-')
-            pair = (int(pairStr[0])-1, int(pairStr[1])-1)
-            pairRev = (int(pairStr[1])-1, int(pairStr[0])-1)
-
-            # remove duplicate links
-            if not (pairRev in links):
-                links.add(pair)
-            else:
-                print "duplicate link: " + str(pair)
+            G.add_edge(int(pairStr[0]), int(pairStr[1]))
 
     obj.close()
 
-    return (nodeNo, links)
+    return (nodeNo, G.edges(), nx.shortest_path(G))
 
 
 class fabric(Topo):
-    def __init__(self, topoFile):
+    def __init__(self, topoFile, topoType=0):
         Topo.__init__(self)
 
-        nodeNo, self.linkset = parseTopoFile(topoFile)
+        nodeNo, linkset, paths = parseTopoFile(topoFile)
 
         hosts = [None] * nodeNo
         switches = [None] * nodeNo
 
         # add hosts and switches
         for idx in range(nodeNo):
-            hosts[idx] = self.addHost('h'+str(idx+1))
-            switches[idx] = self.addSwitch('s'+str(idx+1))
+            hexstr = hex(int(idx+1))[2:]
+            if len(hexstr) == 1:
+                macAddr = "00:00:00:00:00:0" + hexstr
+            elif len(hexstr) == 2:
+                macAddr = "00:00:00:00:00:" + hexstr
+            else:
+                print "Error: Too many hosts"
+                return
 
+            hosts[idx] = self.addHost('h'+str(idx+1) ,
+                                      mac = macAddr)
+            switches[idx] = self.addSwitch('s'+str(idx+1))
             self.addLink(hosts[idx], switches[idx])  # connect a host to each
 
         # add links
         print "nNode " + str(nodeNo)
-        for link in self.linkset:
-            if (link[0] < nodeNo and link[1] < nodeNo):
+        for link in linkset:
+            if (link[0] <= nodeNo and link[1] <= nodeNo):
                 print "link" + str(link)
-
-                self.addLink(switches[link[0]], switches[link[1]])
+                self.addLink(switches[link[0]-1], switches[link[1]-1])
             else:
                 print "invalid link: " + str(link)
 
@@ -68,29 +72,32 @@ class fabric(Topo):
         # dpid, name, {next-hop: physical port}
         #
         # switchInfo format:
-        #   [id(dpid-1)] :  [dpid, name, {remote dpid : port}]
+        #   dpid : [name, {remote dpid : port}]
 
-        self.switchInfo = [None] * nodeNo
+        switchInfo = {}
 
         for idx in range(nodeNo):
-            self.switchInfo[idx] = [idx+1, switches[idx], {}]
+            switchInfo[idx+1] = [switches[idx], {}]
 
-        for link in self.linkset:
-            print "link: " + str((switches[link[0]], switches[link[1]]))
-            sPort, dPort = self.port(switches[link[0]], switches[link[1]])
+        for link in linkset:
+            print "link: " + str((switches[link[0]-1], switches[link[1]-1]))
+            sPort, dPort = self.port(switches[link[0]-1], switches[link[1]-1])
             print "ports: " + str((sPort, dPort))
-            self.switchInfo[link[0]][2][link[1]+1] = sPort
-            self.switchInfo[link[1]][2][link[0]+1] = dPort
+            switchInfo[link[0]][1][link[1]] = sPort
+            switchInfo[link[1]][1][link[0]] = dPort
 
-        pickle.dump(self.switchInfo, "portMap.dat")
-        print self.switchInfo
+        pickle.dump(switchInfo, open("portMap.dat", 'wb'))
+        pickle.dump(paths, open("pathMap.dat", 'wb'))
+
+        # calculate the routings
 
 
 def runTest(filename):
     # generate topology
     topo = fabric(topoFile=filename)
 
-    net = Mininet(topo=topo, controller=RemoteController("ryu"))
+    net = Mininet(topo=topo, controller=RemoteController("ryu"),
+                  switch=partial(OVSSwitch, protocols="OpenFlow13"))
     # net = Mininet(topo=topo, controller=OVSController)
     net.start()
 

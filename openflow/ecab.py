@@ -42,24 +42,28 @@ class CABSwitch(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(CABSwitch, self).__init__(*args, **kwargs)
         self.cab = cab_client()
-        self.cab.create_connection()
+        # self.cab.create_connection()
         self.overflow_cnt = 0
         self.is_overflow = False
         self.queries = 0
         self.packetin = 0
         self.packetout = 0
         self.flowmod = 0
-        self.tracefile = raw_input('Enter Tracename: ')
+        # self.tracefile = raw_input('Enter Tracename: ')
         self.buckets = {}
         self.query_map = {}
-        self.portMap = pickle.load("portMap.dat")
-        self.pathMap = pickle.load("routeMap.dat")
+        self.portMap = pickle.load(open("portMap.dat", 'rb'))
+        self.pathMap = pickle.load(open("pathMap.dat", 'rb'))
+        self.datapathList = {}
+
+        c = threading.Thread(target=self.clean_query_map)
+        c.start()
 
     def id_to_ipInt(self, ID):
-        return 655360 + ID
+        return 167772160 + ID
 
     def ipInt_to_id(self, ipInt):
-        return ipInt - 655360
+        return ipInt - 167772160
 
     def add_flow(self, datapath, table_id, priority, match, inst, buffer_id,
                  hard_timeout=60):
@@ -92,14 +96,14 @@ class CABSwitch(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]
         self.add_flow(datapath, 0, 0, match, inst, ofproto.OFP_NO_BUFFER, 0)
+
+        self.datapathList[datapath.id] = datapath
         # set table1 default : drop
         # inst2 = []
         # self.add_flow(datapath, 1, 0, match, inst2, ofproto.OFP_NO_BUFFER, 0)
 
         # m = threading.Thread(target=self.monitor)
         # m.start()
-        c = threading.Thread(target=self.clean_query_map)
-        c.start()
 
     @set_ev_cls(ofp_event.EventOFPErrorMsg, [HANDSHAKE_DISPATCHER,
                                              CONFIG_DISPATCHER,
@@ -170,9 +174,20 @@ class CABSwitch(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        temp = dst_ip.split('.')
-        arp_resolv_mac = "00:00:00:00:00:" + hex(temp[3])[-2:]
+        # print arp_pkt.dst_ip
+        temp = arp_pkt.dst_ip.split('.')
+        idstr = hex(int(temp[3]))[2:]
+        arp_resolv_mac = ""
 
+        if len(idstr) == 1:
+            arp_resolv_mac = "00:00:00:00:00:0" + idstr
+        elif len(idstr) == 2:
+            arp_resolv_mac = "00:00:00:00:00:" + idstr
+        else:
+            print "Too many hosts"
+            return
+
+        print "resolved: " + arp_resolv_mac
         ether_hd = ethernet.ethernet(dst=eth_pkt.src,
                                      src=arp_resolv_mac,
                                      ethertype=ether.ETH_TYPE_ARP)
@@ -183,7 +198,7 @@ class CABSwitch(app_manager.RyuApp):
         arp_reply.add_protocol(ether_hd)
         arp_reply.add_protocol(arp_hd)
         arp_reply.serialize()
-        data = p.data
+        data = arp_reply.data
         actions = [parser.OFPActionOutput(in_port)]
         out = parser.OFPPacketOut(datapath, ofproto.OFP_NO_BUFFER,
                                   ofproto.OFPP_CONTROLLER, actions, data)
@@ -213,17 +228,20 @@ class CABSwitch(app_manager.RyuApp):
         # rules = self.cab.query(request)
 
         # extract path and port
-        path = pathMap[src_dpid-1][dst_dpid-1]
+        path = self.pathMap[src_dpid][dst_dpid]
+        print path
         dpidPorts = []  # [dpid, srcPort, dstPort]
         sPort = 1  # sPort = 1
 
         for idx in range(len(path)-1):
             curDPID = path[idx]
-            dPort = portMap[curDPID-1][2][path[idx+1]]
+            dPort = self.portMap[curDPID][1][path[idx+1]]
             dpidPorts.append([curDPID, sPort, dPort])
-            sPort = portMap[path[idx+1]-1][2][curDPID]
+            sPort = self.portMap[path[idx+1]][1][curDPID]
 
-        dpidPorts.append(dst_dpid, sPort, 1)
+        dpidPorts.append([dst_dpid, sPort, 1])
+
+        print dpidPorts
 
         for rec in reversed(dpidPorts):
             # TODO Insert ten redundant flows
@@ -238,7 +256,8 @@ class CABSwitch(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(rec[2])]
             inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                                  actions)]
-            self.add_flow(rec[0], 0, 100, matchFwd, inst,
+            self.add_flow(self.datapathList[rec[0]],
+                          0, 100, matchFwd, inst,
                           ofproto.OFP_NO_BUFFER, 20)
 
             # backward
@@ -251,7 +270,8 @@ class CABSwitch(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(rec[1])]
             inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                                  actions)]
-            self.add_flow(rec[0], 0, 100, matchBwd, inst,
+            self.add_flow(self.datapathList[rec[0]],
+                          0, 100, matchBwd, inst,
                           ofproto.OFP_NO_BUFFER, 20)
 
         # cache
@@ -264,12 +284,12 @@ class CABSwitch(app_manager.RyuApp):
         #     self.handle_no_buffer(datapath, msg.data, in_port)
 
     def handle_ip(self, datapath, pkt, ip_pkt, in_port):
-        if proto == inet.IPPROTO_ICMP:
+        if ip_pkt.proto == inet.IPPROTO_ICMP:
             icmp_pkt = pkt.get_protocol(icmp.icmp)
             icmp_type = icmp_pkt.type
 
             if icmp_type == 8 or icmp_type == 0:
-                self.handle_ping(ip_pkt, in_port)
+                self.handle_ping(datapath, ip_pkt, in_port)
 
         return  # boven: do nothing if it's not icmp
         """
@@ -420,6 +440,7 @@ class CABSwitch(app_manager.RyuApp):
                 f.write(string)
 
                 time.sleep(1)
+    """
 
     def clean_query_map(self):
         while True:
@@ -427,4 +448,3 @@ class CABSwitch(app_manager.RyuApp):
             for i in self.query_map.keys():
                 if (time.time() - self.query_map[i]) > 8:
                     del self.query_map[i]
-    """
