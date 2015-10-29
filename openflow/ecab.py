@@ -34,6 +34,7 @@ from ryu import utils
 # import random
 from cab_client import *
 import pickle
+import copy
 
 
 class CABSwitch(app_manager.RyuApp):
@@ -75,6 +76,28 @@ class CABSwitch(app_manager.RyuApp):
         datapath.send_msg(mod)
         # self.flowmod += 1
 
+    def gen_defaults(self, datapath, Type=None, toCntr=True):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch()
+
+        if Type == "arp":
+            match.set_dl_type(ether.ETH_TYPE_ARP)
+        if Type == "ip":
+            match.set_dl_type(ether.ETH_TYPE_IP)
+        if Type == "icmp":
+            match.set_dl_type(ether.ETH_TYPE_IP)
+            match.set_ip_proto(inet.IPPROTO_ICMP)
+        # TCP ...
+
+        actions = []
+        if toCntr:
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        self.add_flow(datapath, 0, 0, match, inst, ofproto.OFP_NO_BUFFER, 0)
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         msg = ev.msg
@@ -90,12 +113,9 @@ class CABSwitch(app_manager.RyuApp):
         mod = parser.OFPFlowMod(datapath=datapath, command=ofproto.OFPFC_DELETE)
         datapath.send_msg(mod)
         # set table0 default rule: go to controller
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
 
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
-        self.add_flow(datapath, 0, 0, match, inst, ofproto.OFP_NO_BUFFER, 0)
+        self.gen_defaults(datapath, "arp")
+        self.gen_defaults(datapath, "icmp")
 
         self.datapathList[datapath.id] = datapath
         # set table1 default : drop
@@ -123,7 +143,6 @@ class CABSwitch(app_manager.RyuApp):
         datapath = msg.datapath
         # dpid = datapath.id
 
-        # ofproto and parser is version related
         ofproto = datapath.ofproto
 
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
@@ -147,28 +166,21 @@ class CABSwitch(app_manager.RyuApp):
 
         if ethertype == ether.ETH_TYPE_IP:
             ip_pkt = pkt.get_protocol(ipv4.ipv4)
-            self.handle_ip(datapath, pkt, ip_pkt, in_port)
-            return
+            actions = self.handle_ip(datapath, pkt, ip_pkt, in_port)
+            # print actions
+            self.send_packet_out(datapath, msg, in_port, actions)
 
-    def handle_no_buffer(self, datapath, data, in_port):
-        ofp = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
-        actions = [ofp_parser.OFPActionOutput(3)]
-        req = ofp_parser.OFPPacketOut(datapath, ofp.OFP_NO_BUFFER,
-                                      in_port, actions, data)
-        datapath.send_msg(req)
-        self.packetout += 1
+    def send_packet_out(self, datapath, msg, in_port, actions=[]):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        data = None
 
-    def send_packet_out(self, datapath, msg, in_port):
-        ofp = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
-        if msg.buffer_id == ofp.OFP_NO_BUFFER:
-            self.handle_no_buffer(datapath, msg.data, in_port)
-        else:
-            actions = [ofp_parser.OFPActionOutput(3)]
-            req = ofp_parser.OFPPacketOut(datapath, msg.buffer_id,
-                                          in_port, actions)
-            datapath.send_msg(req)
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                  in_port=in_port, actions=actions, data=data)
+        datapath.send_msg(out)
 
     def handle_arp(self, datapath, eth_pkt, arp_pkt, in_port):
         ofproto = datapath.ofproto
@@ -187,7 +199,7 @@ class CABSwitch(app_manager.RyuApp):
             print "Too many hosts"
             return
 
-        print "resolved: " + arp_resolv_mac
+        # print "resolved: " + arp_resolv_mac
         ether_hd = ethernet.ethernet(dst=eth_pkt.src,
                                      src=arp_resolv_mac,
                                      ethertype=ether.ETH_TYPE_ARP)
@@ -215,12 +227,12 @@ class CABSwitch(app_manager.RyuApp):
         dst_dpid = int(dstHost.split('.')[3])
 
         # if not the fisrt packet of the flow, don't query eCAB
-        key = srcHost + dstHost
+        # key = srcHost + dstHost
 
-        if key in self.query_map:
-            # drop the packet
-            return
-        self.query_map[key] = time.time()
+        # if key in self.query_map:
+        # drop the packet
+        #    return
+        # self.query_map[key] = time.time()
 
         # TODO: query eCAB
         # request = pkt_h(ipv4_to_int(ip_src), ipv4_to_int(ip_dst),
@@ -229,7 +241,7 @@ class CABSwitch(app_manager.RyuApp):
 
         # extract path and port
         path = self.pathMap[src_dpid][dst_dpid]
-        print path
+        # print path
         dpidPorts = []  # [dpid, srcPort, dstPort]
         sPort = 1  # sPort = 1
 
@@ -241,11 +253,25 @@ class CABSwitch(app_manager.RyuApp):
 
         dpidPorts.append([dst_dpid, sPort, 1])
 
-        print dpidPorts
+        # print dpidPorts
 
+        thisAction = []
         for rec in reversed(dpidPorts):
             # TODO Insert ten redundant flows
-
+            """
+            for redIdx in range(10):
+                matchRed = parser.OFPMatch()
+                matchRed.set_dl_type(ether.ETH_TYPE_IP)
+                matchRed.set_ipv4_dst(self.id_to_ipInt(redIdx)*2)
+                matchRed.set_ip_proto(inet.IPPROTO_TCP)
+                actions = [parser.OFPActionOutput(1)]
+                inst = [parser.OFPInstructionActions(
+                    ofproto.OFPIT_APPLY_ACTIONS,
+                    actions)]
+                self.add_flow(self.datapathList[rec[0]],
+                              0, 100, matchRed, inst,
+                              ofproto.OFP_NO_BUFFER, 3)
+            """
             # forward
             matchFwd = parser.OFPMatch()
             matchFwd.set_in_port(rec[1])
@@ -254,11 +280,16 @@ class CABSwitch(app_manager.RyuApp):
             matchFwd.set_ipv4_dst(self.id_to_ipInt(dst_dpid))
             matchFwd.set_ip_proto(inet.IPPROTO_ICMP)
             actions = [parser.OFPActionOutput(rec[2])]
+
+            if (datapath.id == rec[0]):
+                # print "dpid: s" + str(rec[0]) + " output: " + str(rec[2])
+                thisAction = copy.deepcopy(actions)
+
             inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                                  actions)]
             self.add_flow(self.datapathList[rec[0]],
                           0, 100, matchFwd, inst,
-                          ofproto.OFP_NO_BUFFER, 20)
+                          ofproto.OFP_NO_BUFFER, 5)
 
             # backward
             matchBwd = parser.OFPMatch()
@@ -272,8 +303,10 @@ class CABSwitch(app_manager.RyuApp):
                                                  actions)]
             self.add_flow(self.datapathList[rec[0]],
                           0, 100, matchBwd, inst,
-                          ofproto.OFP_NO_BUFFER, 20)
+                          ofproto.OFP_NO_BUFFER, 5)
 
+        # print thisAction
+        return thisAction
         # cache
 
         # actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD, 0)]
@@ -284,14 +317,15 @@ class CABSwitch(app_manager.RyuApp):
         #     self.handle_no_buffer(datapath, msg.data, in_port)
 
     def handle_ip(self, datapath, pkt, ip_pkt, in_port):
+        actions = []
         if ip_pkt.proto == inet.IPPROTO_ICMP:
             icmp_pkt = pkt.get_protocol(icmp.icmp)
             icmp_type = icmp_pkt.type
 
             if icmp_type == 8 or icmp_type == 0:
-                self.handle_ping(datapath, ip_pkt, in_port)
+                actions = self.handle_ping(datapath, ip_pkt, in_port)
 
-        return  # boven: do nothing if it's not icmp
+        return actions  # boven: do nothing if it's not icmp
         """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -440,6 +474,16 @@ class CABSwitch(app_manager.RyuApp):
                 f.write(string)
 
                 time.sleep(1)
+    """
+    """
+    def handle_no_buffer(self, datapath, data, in_port):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+        actions = [ofp_parser.OFPActionOutput(3)]
+        req = ofp_parser.OFPPacketOut(datapath, ofp.OFP_NO_BUFFER,
+                                      in_port, actions, data)
+        datapath.send_msg(req)
+        self.packetout += 1
     """
 
     def clean_query_map(self):

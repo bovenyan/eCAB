@@ -20,7 +20,7 @@ def parseTopoFile(filename):
     for line in lines:
         line = line[:-1]
 
-        print line
+        # print line
         if 'node' in line:
             temp = line.split(':')
             nodeNo = int(temp[1])
@@ -40,30 +40,49 @@ class fabric(Topo):
 
         nodeNo, linkset, paths = parseTopoFile(topoFile)
 
-        hosts = [None] * nodeNo
+        # hosts = [None] * nodeNo
         switches = [None] * nodeNo
 
+        # select the two hosts with longest path
+        longest = 0
+        selPath = [None, None]
+
+        for i in paths:
+            for j in paths:
+                if len(paths[i][j]) > longest:
+                    longest = len(paths[i][j])
+                    selPath[0] = i
+                    selPath[1] = j
+
+        print "Selected: " + str(selPath)
+        print paths[selPath[0]][selPath[1]]
         # add hosts and switches
         for idx in range(nodeNo):
-            hexstr = hex(int(idx+1))[2:]
-            if len(hexstr) == 1:
-                macAddr = "00:00:00:00:00:0" + hexstr
-            elif len(hexstr) == 2:
-                macAddr = "00:00:00:00:00:" + hexstr
-            else:
-                print "Error: Too many hosts"
-                return
-
-            hosts[idx] = self.addHost('h'+str(idx+1) ,
-                                      mac = macAddr)
             switches[idx] = self.addSwitch('s'+str(idx+1))
-            self.addLink(hosts[idx], switches[idx])  # connect a host to each
+
+            if (idx+1 == selPath[0] or idx+1 == selPath[1]):
+                hexstr = hex(int(idx+1))[2:]
+                if len(hexstr) == 1:
+                    macAddr = "00:00:00:00:00:0" + hexstr
+                elif len(hexstr) == 2:
+                    macAddr = "00:00:00:00:00:" + hexstr
+                else:
+                    print "Error: Too many hosts"
+                    return
+
+                ipAddr = "10.0.0."+str(idx+1)
+
+                host = self.addHost('h'+str(idx+1),
+                                    mac = macAddr,
+                                    ip = ipAddr)
+                self.addLink(host, switches[idx])
+                # connect a host to each
 
         # add links
-        print "nNode " + str(nodeNo)
+        # print "nNode " + str(nodeNo)
         for link in linkset:
             if (link[0] <= nodeNo and link[1] <= nodeNo):
-                print "link" + str(link)
+                # print "link" + str(link)
                 self.addLink(switches[link[0]-1], switches[link[1]-1])
             else:
                 print "invalid link: " + str(link)
@@ -80,9 +99,9 @@ class fabric(Topo):
             switchInfo[idx+1] = [switches[idx], {}]
 
         for link in linkset:
-            print "link: " + str((switches[link[0]-1], switches[link[1]-1]))
+            # print "link: " + str((switches[link[0]-1], switches[link[1]-1]))
             sPort, dPort = self.port(switches[link[0]-1], switches[link[1]-1])
-            print "ports: " + str((sPort, dPort))
+            # print "ports: " + str((sPort, dPort))
             switchInfo[link[0]][1][link[1]] = sPort
             switchInfo[link[1]][1][link[0]] = dPort
 
